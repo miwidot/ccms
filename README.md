@@ -25,9 +25,9 @@ CCMS (Claude Code Machine Sync) is a lightweight bash script that helps you sync
 
 ## Prerequisites
 
-- A Unix-like system (macOS, Linux, WSL)
+- A Unix-like system (macOS, Linux, BSD, WSL)
 - SSH access to a remote server
-- rsync installed (usually pre-installed on most systems)
+- rsync installed (the installer will check and provide installation instructions)
 
 ## Installation
 
@@ -38,9 +38,15 @@ CCMS (Claude Code Machine Sync) is a lightweight bash script that helps you sync
 git clone https://github.com/miwidot/ccms.git
 cd ccms
 
-# Run the installer
+# Run the installer (checks for rsync and provides OS-specific instructions)
 ./install.sh
 ```
+
+The installer will:
+- Check if rsync is installed
+- Provide installation instructions for your specific OS if needed
+- Install ccms to your chosen directory
+- Help you add it to your PATH
 
 ### Option 2: Manual Installation
 
