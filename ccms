@@ -1,0 +1,355 @@
+#!/bin/bash
+
+# Claude Code Machine Sync (ccms)
+# Safely sync ~/.claude/ directory with remote server
+
+set -euo pipefail
+
+# Constants
+CLAUDE_DIR="$HOME/.claude"
+CONFIG_DIR="$HOME/.ccms"
+CONFIG_FILE="$CONFIG_DIR/config"
+EXCLUDE_FILE="$CONFIG_DIR/exclude"
+BACKUP_DIR="$CONFIG_DIR/backups"
+LOCK_FILE="$CONFIG_DIR/sync.lock"
+VERSION="1.0.0"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Initialize directories
+init_dirs() {
+    mkdir -p "$CONFIG_DIR" "$BACKUP_DIR"
+    
+    # Create empty exclude file if it doesn't exist
+    if [[ ! -f "$EXCLUDE_FILE" ]]; then
+        touch "$EXCLUDE_FILE"
+        echo "# Add exclude patterns here if needed (one per line)" > "$EXCLUDE_FILE"
+    fi
+}
+
+# Print colored output
+print_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+# Check if lock file exists
+check_lock() {
+    if [[ -f "$LOCK_FILE" ]]; then
+        print_error "Another sync operation is in progress (lock file exists)"
+        print_info "If no sync is running, remove: $LOCK_FILE"
+        exit 1
+    fi
+}
+
+# Create lock file
+create_lock() {
+    echo $$ > "$LOCK_FILE"
+}
+
+# Remove lock file
+remove_lock() {
+    rm -f "$LOCK_FILE"
+}
+
+# Trap to ensure lock is removed on exit
+trap remove_lock EXIT
+
+# Load configuration
+load_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        print_error "Configuration not found. Run 'ccms config' first"
+        exit 1
+    fi
+    
+    source "$CONFIG_FILE"
+    
+    # Validate required variables
+    if [[ -z "${REMOTE_HOST:-}" || -z "${REMOTE_PATH:-}" ]]; then
+        print_error "Invalid configuration. Run 'ccms config' to set up"
+        exit 1
+    fi
+}
+
+# Configure ccms
+config_ccms() {
+    print_info "Claude Code Machine Sync Configuration"
+    echo
+    
+    # Read current config if exists
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+        print_info "Current configuration found"
+    fi
+    
+    # Get remote host
+    read -p "Remote host (SSH alias or hostname) [${REMOTE_HOST:-}]: " new_host
+    REMOTE_HOST="${new_host:-${REMOTE_HOST:-}}"
+    
+    # Get remote path
+    read -p "Remote path for claude backup [${REMOTE_PATH:-~/claude-backup}]: " new_path
+    REMOTE_PATH="${new_path:-${REMOTE_PATH:-~/claude-backup}}"
+    
+    # Get rsync options
+    read -p "Additional rsync options [${RSYNC_OPTS:--avz --delete}]: " new_opts
+    RSYNC_OPTS="${new_opts:-${RSYNC_OPTS:--avz --delete}}"
+    
+    # Save configuration
+    cat > "$CONFIG_FILE" << EOF
+# ccms configuration
+REMOTE_HOST="$REMOTE_HOST"
+REMOTE_PATH="$REMOTE_PATH"
+RSYNC_OPTS="$RSYNC_OPTS"
+EOF
+    
+    print_success "Configuration saved to $CONFIG_FILE"
+    
+    # Test connection
+    print_info "Testing SSH connection..."
+    if ssh "$REMOTE_HOST" "mkdir -p '$REMOTE_PATH' && echo 'Connection successful'"; then
+        print_success "SSH connection test passed"
+    else
+        print_error "SSH connection test failed. Check your SSH configuration"
+        exit 1
+    fi
+}
+
+# Create backup
+create_backup() {
+    local backup_name="claude-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+    local backup_path="$BACKUP_DIR/$backup_name"
+    
+    print_info "Creating backup: $backup_name"
+    tar -czf "$backup_path" -C "$HOME" .claude 2>/dev/null || {
+        print_error "Failed to create backup"
+        return 1
+    }
+    
+    # Keep only last 5 backups
+    ls -t "$BACKUP_DIR"/claude-backup-*.tar.gz 2>/dev/null | tail -n +6 | xargs -r rm -f
+    
+    print_success "Backup created: $backup_path"
+    return 0
+}
+
+# Push to remote
+push_to_remote() {
+    load_config
+    check_lock
+    create_lock
+    
+    print_info "Pushing $CLAUDE_DIR to $REMOTE_HOST:$REMOTE_PATH"
+    
+    # Build rsync command
+    local rsync_cmd="rsync $RSYNC_OPTS"
+    
+    if [[ -f "$EXCLUDE_FILE" ]]; then
+        rsync_cmd="$rsync_cmd --exclude-from='$EXCLUDE_FILE'"
+    fi
+    
+    # Dry run first if not forced
+    if [[ "${FORCE:-}" != "true" ]]; then
+        print_info "Performing dry run..."
+        eval "$rsync_cmd --dry-run '$CLAUDE_DIR/' '$REMOTE_HOST:$REMOTE_PATH/'" || {
+            print_error "Dry run failed"
+            exit 1
+        }
+        
+        read -p "Proceed with push? [y/N] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            print_info "Push cancelled"
+            exit 0
+        fi
+    fi
+    
+    # Actual push
+    eval "$rsync_cmd '$CLAUDE_DIR/' '$REMOTE_HOST:$REMOTE_PATH/'" || {
+        print_error "Push failed"
+        exit 1
+    }
+    
+    print_success "Successfully pushed to $REMOTE_HOST:$REMOTE_PATH"
+}
+
+# Pull from remote
+pull_from_remote() {
+    load_config
+    check_lock
+    create_lock
+    
+    print_info "Pulling from $REMOTE_HOST:$REMOTE_PATH to $CLAUDE_DIR"
+    
+    # Create backup first
+    if [[ "${NO_BACKUP:-}" != "true" ]]; then
+        create_backup || {
+            print_error "Backup failed. Use --no-backup to skip"
+            exit 1
+        }
+    fi
+    
+    # Build rsync command
+    local rsync_cmd="rsync $RSYNC_OPTS"
+    
+    if [[ -f "$EXCLUDE_FILE" ]]; then
+        rsync_cmd="$rsync_cmd --exclude-from='$EXCLUDE_FILE'"
+    fi
+    
+    # Dry run first if not forced
+    if [[ "${FORCE:-}" != "true" ]]; then
+        print_info "Performing dry run..."
+        eval "$rsync_cmd --dry-run '$REMOTE_HOST:$REMOTE_PATH/' '$CLAUDE_DIR/'" || {
+            print_error "Dry run failed"
+            exit 1
+        }
+        
+        read -p "Proceed with pull? [y/N] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            print_info "Pull cancelled"
+            exit 0
+        fi
+    fi
+    
+    # Actual pull
+    eval "$rsync_cmd '$REMOTE_HOST:$REMOTE_PATH/' '$CLAUDE_DIR/'" || {
+        print_error "Pull failed"
+        exit 1
+    }
+    
+    print_success "Successfully pulled from $REMOTE_HOST:$REMOTE_PATH"
+}
+
+# Show status
+show_status() {
+    load_config
+    
+    print_info "Checking sync status..."
+    
+    # Build rsync command for dry run
+    local rsync_cmd="rsync $RSYNC_OPTS --dry-run -i"
+    
+    if [[ -f "$EXCLUDE_FILE" ]]; then
+        rsync_cmd="$rsync_cmd --exclude-from='$EXCLUDE_FILE'"
+    fi
+    
+    echo
+    print_info "Local → Remote changes:"
+    eval "$rsync_cmd '$CLAUDE_DIR/' '$REMOTE_HOST:$REMOTE_PATH/'" | grep -v "^\.d" || echo "  No changes"
+    
+    echo
+    print_info "Remote → Local changes:"
+    eval "$rsync_cmd '$REMOTE_HOST:$REMOTE_PATH/' '$CLAUDE_DIR/'" | grep -v "^\.d" || echo "  No changes"
+}
+
+# Show help
+show_help() {
+    cat << EOF
+Claude Code Machine Sync (ccms) v$VERSION
+
+Usage: ccms [command] [options]
+
+Commands:
+  push        Push local ~/.claude to remote server
+  pull        Pull from remote server to local ~/.claude
+  status      Show differences between local and remote
+  config      Configure remote server settings
+  backup      Create a local backup of ~/.claude
+  help        Show this help message
+
+Options:
+  -f, --force       Skip confirmation prompts
+  -n, --no-backup   Skip backup when pulling (not recommended)
+  -v, --verbose     Show detailed output
+
+Examples:
+  ccms config                  # Set up remote server
+  ccms push                    # Push changes to server
+  ccms pull                    # Pull changes from server
+  ccms status                  # Check sync status
+  ccms backup                  # Create manual backup
+
+Configuration file: $CONFIG_FILE
+Exclude patterns: $EXCLUDE_FILE
+Backups directory: $BACKUP_DIR
+EOF
+}
+
+# Main script
+main() {
+    init_dirs
+    
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -f|--force)
+                FORCE=true
+                shift
+                ;;
+            -n|--no-backup)
+                NO_BACKUP=true
+                shift
+                ;;
+            -v|--verbose)
+                RSYNC_OPTS="$RSYNC_OPTS -v"
+                shift
+                ;;
+            push)
+                shift
+                push_to_remote
+                exit 0
+                ;;
+            pull)
+                shift
+                pull_from_remote
+                exit 0
+                ;;
+            status)
+                shift
+                show_status
+                exit 0
+                ;;
+            config)
+                shift
+                config_ccms
+                exit 0
+                ;;
+            backup)
+                shift
+                create_backup
+                exit 0
+                ;;
+            help|--help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                print_error "Unknown command: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+    
+    # No command specified
+    show_help
+}
+
+# Run main
+main "$@"
