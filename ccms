@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Claude Code Machine Sync (ccms)
 # Safely sync ~/.claude/ directory with remote server
