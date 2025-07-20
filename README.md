@@ -178,10 +178,12 @@ CCMS stores its configuration in `~/.ccms/`:
 
 ```
 ~/.ccms/
-├── config          # Server settings
-├── exclude         # Optional exclude patterns
-├── backups/        # Local backups (auto-managed)
-└── sync.lock       # Prevents concurrent operations
+├── config              # Server settings
+├── exclude             # Optional exclude patterns
+├── backups/            # Local backups (auto-managed)
+├── sync.lock           # Prevents concurrent operations
+├── checksums           # Local file SHA256 checksums
+└── remote_checksums    # Downloaded remote checksums (temporary)
 ```
 
 ### What Gets Synced?
