@@ -12,7 +12,9 @@ CONFIG_FILE="$CONFIG_DIR/config"
 EXCLUDE_FILE="$CONFIG_DIR/exclude"
 BACKUP_DIR="$CONFIG_DIR/backups"
 LOCK_FILE="$CONFIG_DIR/sync.lock"
-VERSION="1.0.0"
+CHECKSUM_FILE="$CONFIG_DIR/checksums"
+REMOTE_CHECKSUM_FILE="$CONFIG_DIR/remote_checksums"
+VERSION="1.0.1"
 
 # Colors for output
 RED='\033[0;31m'
@@ -70,6 +72,144 @@ remove_lock() {
 
 # Trap to ensure lock is removed on exit
 trap remove_lock EXIT
+
+# Generate checksums for files
+generate_checksums() {
+    local target_dir="$1"
+    local output_file="$2"
+    
+    if [[ ! -d "$target_dir" ]]; then
+        print_error "Directory not found: $target_dir"
+        return 1
+    fi
+    
+    print_info "Generating checksums for $target_dir"
+    
+    # Create temporary file for checksums
+    local temp_file
+    temp_file=$(mktemp)
+    
+    # Generate checksums, excluding files from exclude pattern if it exists
+    if [[ -f "$EXCLUDE_FILE" && -s "$EXCLUDE_FILE" ]]; then
+        # Use rsync --list-only to get files that would be synced (respecting excludes)
+        local rsync_cmd="rsync -avz --dry-run --list-only"
+        rsync_cmd="$rsync_cmd --exclude-from='$EXCLUDE_FILE'"
+        
+        # Get list of files that would be synced and calculate their checksums
+        eval "$rsync_cmd '$target_dir/' /tmp/dummy-target/" 2>/dev/null | \
+        grep -E '^-' | awk '{print $5}' | while read -r file; do
+            if [[ -f "$target_dir/$file" ]]; then
+                sha256sum "$target_dir/$file" >> "$temp_file" 2>/dev/null || true
+            fi
+        done
+    else
+        # No excludes, checksum all files
+        find "$target_dir" -type f -exec sha256sum {} \; 2>/dev/null > "$temp_file" || true
+    fi
+    
+    # Remove the target directory prefix from paths to make checksums portable
+    sed "s|$target_dir/||g" "$temp_file" | sort > "$output_file"
+    rm -f "$temp_file"
+    
+    local file_count
+    file_count=$(wc -l < "$output_file")
+    print_success "Generated checksums for $file_count files"
+}
+
+# Verify checksums
+verify_checksums() {
+    local target_dir="$1"
+    local checksum_file="$2"
+    local description="$3"
+    
+    if [[ ! -f "$checksum_file" ]]; then
+        print_warning "No checksum file found: $checksum_file"
+        return 0
+    fi
+    
+    if [[ ! -s "$checksum_file" ]]; then
+        print_info "Checksum file is empty, skipping verification"
+        return 0
+    fi
+    
+    print_info "Verifying $description checksums..."
+    
+    local failed=0
+    local total=0
+    local missing=0
+    
+    while IFS= read -r line; do
+        if [[ -z "$line" ]]; then continue; fi
+        
+        local expected_hash
+        local file_path
+        expected_hash=$(echo "$line" | awk '{print $1}')
+        file_path=$(echo "$line" | cut -d' ' -f3-)
+        
+        total=$((total + 1))
+        
+        local full_path="$target_dir/$file_path"
+        
+        if [[ ! -f "$full_path" ]]; then
+            print_warning "Missing file: $file_path"
+            missing=$((missing + 1))
+            continue
+        fi
+        
+        local actual_hash
+        actual_hash=$(sha256sum "$full_path" 2>/dev/null | awk '{print $1}')
+        
+        if [[ "$expected_hash" != "$actual_hash" ]]; then
+            print_error "Checksum mismatch: $file_path"
+            failed=$((failed + 1))
+        fi
+    done < "$checksum_file"
+    
+    if [[ $failed -gt 0 || $missing -gt 0 ]]; then
+        print_error "Verification failed: $failed corrupted, $missing missing out of $total files"
+        return 1
+    else
+        print_success "All $total files verified successfully"
+        return 0
+    fi
+}
+
+# Download remote checksums for verification
+download_remote_checksums() {
+    load_config
+    
+    print_info "Downloading remote checksums..."
+    
+    # Try to download remote checksum file
+    scp "$REMOTE_HOST:$REMOTE_PATH/.ccms-checksums" "$REMOTE_CHECKSUM_FILE" 2>/dev/null || {
+        print_warning "No remote checksums found (this is normal for first-time setup)"
+        return 0
+    }
+    
+    print_success "Remote checksums downloaded"
+    return 0
+}
+
+# Upload checksums to remote
+upload_checksums() {
+    load_config
+    
+    if [[ ! -f "$CHECKSUM_FILE" ]]; then
+        print_warning "No local checksums to upload"
+        return 0
+    fi
+    
+    print_info "Uploading checksums to remote..."
+    
+    # Upload checksum file to remote
+    scp "$CHECKSUM_FILE" "$REMOTE_HOST:$REMOTE_PATH/.ccms-checksums" || {
+        print_error "Failed to upload checksums"
+        return 1
+    }
+    
+    print_success "Checksums uploaded to remote"
+    return 0
+}
 
 # Load configuration
 load_config() {
@@ -156,6 +296,12 @@ push_to_remote() {
     
     print_info "Pushing $CLAUDE_DIR to $REMOTE_HOST:$REMOTE_PATH"
     
+    # Generate checksums before push
+    generate_checksums "$CLAUDE_DIR" "$CHECKSUM_FILE" || {
+        print_error "Failed to generate checksums"
+        exit 1
+    }
+    
     # Build rsync command
     local rsync_cmd="rsync $RSYNC_OPTS"
     
@@ -185,7 +331,13 @@ push_to_remote() {
         exit 1
     }
     
+    # Upload checksums to remote for future verification
+    upload_checksums || {
+        print_warning "Failed to upload checksums (sync completed but verification may not work)"
+    }
+    
     print_success "Successfully pushed to $REMOTE_HOST:$REMOTE_PATH"
+    print_info "File integrity checksums generated and uploaded"
 }
 
 # Pull from remote
@@ -195,6 +347,9 @@ pull_from_remote() {
     create_lock
     
     print_info "Pulling from $REMOTE_HOST:$REMOTE_PATH to $CLAUDE_DIR"
+    
+    # Download remote checksums first
+    download_remote_checksums
     
     # Create backup first
     if [[ "${NO_BACKUP:-}" != "true" ]]; then
@@ -233,7 +388,19 @@ pull_from_remote() {
         exit 1
     }
     
+    # Verify checksums after pull
+    if [[ -f "$REMOTE_CHECKSUM_FILE" ]]; then
+        verify_checksums "$CLAUDE_DIR" "$REMOTE_CHECKSUM_FILE" "post-pull" || {
+            print_error "Checksum verification failed! Files may be corrupted."
+            print_info "Consider restoring from backup: $BACKUP_DIR"
+            exit 1
+        }
+    else
+        print_warning "No remote checksums available for verification"
+    fi
+    
     print_success "Successfully pulled from $REMOTE_HOST:$REMOTE_PATH"
+    print_info "File integrity verified"
 }
 
 # Show status
@@ -256,6 +423,85 @@ show_status() {
     echo
     print_info "Remote → Local changes:"
     eval "$rsync_cmd '$REMOTE_HOST:$REMOTE_PATH/' '$CLAUDE_DIR/'" | grep -v "^\.d" || echo "  No changes"
+    
+    echo
+    print_info "File integrity status:"
+    
+    # Check local checksums
+    if [[ -f "$CHECKSUM_FILE" ]]; then
+        if verify_checksums "$CLAUDE_DIR" "$CHECKSUM_FILE" "local"; then
+            print_success "Local files integrity: OK"
+        else
+            print_error "Local files integrity: FAILED"
+        fi
+    else
+        print_warning "No local checksums found"
+    fi
+    
+    # Check if we can get remote checksums
+    download_remote_checksums > /dev/null 2>&1
+    if [[ -f "$REMOTE_CHECKSUM_FILE" ]]; then
+        echo
+        print_info "Remote checksums available - run 'ccms pull' to verify after sync"
+    else
+        print_warning "No remote checksums available"
+    fi
+}
+
+# Verify file integrity
+verify_files() {
+    print_info "Verifying file integrity..."
+    
+    # Check if we have local checksums
+    if [[ ! -f "$CHECKSUM_FILE" ]]; then
+        print_warning "No local checksums found. Generating checksums now..."
+        generate_checksums "$CLAUDE_DIR" "$CHECKSUM_FILE" || {
+            print_error "Failed to generate checksums"
+            exit 1
+        }
+        print_success "Checksums generated. Run verify again to check integrity."
+        exit 0
+    fi
+    
+    # Verify local files against local checksums
+    echo
+    print_info "Checking local files integrity..."
+    if verify_checksums "$CLAUDE_DIR" "$CHECKSUM_FILE" "local"; then
+        print_success "Local files integrity: VERIFIED"
+    else
+        print_error "Local files integrity: FAILED"
+        echo
+        print_info "Possible causes:"
+        echo "  - Files have been modified since last push"
+        echo "  - File corruption occurred"
+        echo "  - Checksums are outdated"
+        echo
+        print_info "Solutions:"
+        echo "  - If files were intentionally modified: run 'ccms push' to update"
+        echo "  - If corruption suspected: restore from backup or run 'ccms pull'"
+        exit 1
+    fi
+    
+    # Download and check remote checksums if available
+    if load_config 2>/dev/null; then
+        echo
+        print_info "Checking remote checksums..."
+        download_remote_checksums
+        
+        if [[ -f "$REMOTE_CHECKSUM_FILE" ]]; then
+            if cmp -s "$CHECKSUM_FILE" "$REMOTE_CHECKSUM_FILE"; then
+                print_success "Local and remote checksums match"
+            else
+                print_warning "Local and remote checksums differ"
+                print_info "This means files have changed since last sync"
+                print_info "Run 'ccms status' to see what changed"
+            fi
+        else
+            print_warning "No remote checksums available"
+        fi
+    else
+        print_warning "No configuration found. Run 'ccms config' first to check remote."
+    fi
 }
 
 # Show help
@@ -269,6 +515,7 @@ Commands:
   push        Push local ~/.claude to remote server
   pull        Pull from remote server to local ~/.claude
   status      Show differences between local and remote
+  verify      Verify file integrity using checksums
   config      Configure remote server settings
   backup      Create a local backup of ~/.claude
   help        Show this help message
@@ -283,6 +530,7 @@ Examples:
   ccms push                    # Push changes to server
   ccms pull                    # Pull changes from server
   ccms status                  # Check sync status
+  ccms verify                  # Verify file integrity
   ccms backup                  # Create manual backup
 
 Configuration file: $CONFIG_FILE
@@ -323,6 +571,11 @@ main() {
             status)
                 shift
                 show_status
+                exit 0
+                ;;
+            verify)
+                shift
+                verify_files
                 exit 0
                 ;;
             config)

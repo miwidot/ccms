@@ -15,6 +15,7 @@ CCMS (Claude Code Machine Sync) is a lightweight bash script that helps you sync
 - 🎯 **Complete sync** - Syncs entire ~/.claude/ directory by default
 - 🔍 **Dry run mode** - Preview changes before applying
 - 📊 **Status checking** - See differences between local and remote
+- ✅ **File integrity** - SHA256 checksums verify data integrity
 
 ## Why Use CCMS?
 
@@ -136,6 +137,7 @@ ccms status
 | `push` | Upload local ~/.claude to server | `ccms push` |
 | `pull` | Download from server to local | `ccms pull` |
 | `status` | Show what would be synced | `ccms status` |
+| `verify` | Check file integrity using checksums | `ccms verify` |
 | `config` | Set up or modify server settings | `ccms config` |
 | `backup` | Create local backup manually | `ccms backup` |
 | `help` | Show help information | `ccms help` |
@@ -163,6 +165,9 @@ ccms pull --no-backup --force
 # See what changed before syncing
 ccms status
 ccms push  # If changes look good
+
+# Verify file integrity
+ccms verify
 ```
 
 ## Configuration Details
@@ -225,6 +230,39 @@ Rsync options explained:
 2. **Automatic backups** - Before each pull (last 5 kept)
 3. **Dry run by default** - Shows changes before applying
 4. **SSH validation** - Tests connection during config
+5. **File integrity** - SHA256 checksums detect corruption/tampering
+
+## File Integrity Verification
+
+CCMS includes built-in file integrity protection using SHA256 checksums:
+
+### How It Works
+- **On push**: Generates checksums for all files and uploads them to the server
+- **On pull**: Downloads remote checksums and verifies files after sync
+- **Manual verification**: Use `ccms verify` to check current file integrity
+
+### What Gets Protected
+- All files in your `~/.claude/` directory
+- Respects exclude patterns (if any)
+- Detects corruption, tampering, or incomplete transfers
+
+### When Verification Happens
+```bash
+# Automatic verification
+ccms push    # → generates and uploads checksums
+ccms pull    # → downloads and verifies against checksums
+
+# Manual verification
+ccms verify  # → checks current files against last known good state
+ccms status  # → includes integrity status in output
+```
+
+### If Verification Fails
+CCMS will:
+1. **Stop the operation** - Won't complete if integrity fails
+2. **Show details** - Lists which files failed verification
+3. **Suggest solutions** - Restore from backup or re-sync
+4. **Preserve backups** - Your local backup is safe for recovery
 
 ## Automation
 
